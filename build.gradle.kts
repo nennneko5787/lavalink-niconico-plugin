@@ -3,11 +3,15 @@ plugins {
     alias(libs.plugins.lavalink)
 }
 
-group = "com.example"
-version = "0.1.0"
+group = "com.nennneko5787.nndplugin"
+version = "0.0.1"
+
+base {
+	archivesName = "NicoNicoPlugin"
+}
 
 lavalinkPlugin {
-    name = "plugin-template"
+    name = "NicoNicoPlugin"
     apiVersion = libs.versions.lavalink.api
     serverVersion = libs.versions.lavalink.server
 }
@@ -25,5 +29,7 @@ tasks {
 }
 
 dependencies {
-    // add your dependencies here
+	compileOnly("com.github.topi314.lavasearch:lavasearch:1.0.0")
+	implementation("com.github.topi314.lavasearch:lavasearch-plugin-api:1.0.0")
+    implementation("commons-io:commons-io:2.20.0")
 }
