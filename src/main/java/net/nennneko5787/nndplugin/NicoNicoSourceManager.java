@@ -16,6 +16,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -25,12 +26,18 @@ import java.util.stream.Collectors;
 
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.util.EntityUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static com.sedmelluq.discord.lavaplayer.tools.FriendlyException.Severity.SUSPICIOUS;
 
 public class NicoNicoSourceManager implements AudioSourceManager {
+
+    private static final Logger log = LoggerFactory.getLogger(NicoNicoSourceManager.class);
+
     public static final Pattern URL_PATTERN = Pattern.compile(
-            "(https?://)?(www\\.)?(?:nicovideo\\.jp/watch|nico\\.ms)/(?<videoId>[a-z]{2}\\d+)");
+            "(https?:\\/\\/)?(www\\.)?(?:nicovideo\\.jp\\/watch|nico\\.ms)\\/(?<videoId>[a-z]{2}\\d+)");
 
     private final HttpInterfaceManager httpInterfaceManager;
     private String domandBid;
@@ -39,6 +46,7 @@ public class NicoNicoSourceManager implements AudioSourceManager {
     private Map<String, List<String>> outputs;
     private String outputLabel;
     private String hslContentUrl;
+    private String cookies;
 
     public NicoNicoSourceManager() {
         httpInterfaceManager = HttpClientTools.createDefaultThreadLocalManager();
@@ -46,7 +54,7 @@ public class NicoNicoSourceManager implements AudioSourceManager {
 
     @Override
     public String getSourceName() {
-        return "NicoNico";
+        return "niconico";
     }
 
     @Override
@@ -57,7 +65,12 @@ public class NicoNicoSourceManager implements AudioSourceManager {
         }
         var videoId = matcher.group("videoId");
 
-        videoInfo = fetchVideoInfo(videoId);
+        JsonBrowser info = fetchVideoInfo(videoId);
+        if (info == null || info.isNull()) {
+            log.warn("Failed to fetch or parse video info for videoId: {}", videoId);
+        }
+        this.videoInfo = info;
+
         outputs = extractAvailableStreams(videoInfo, true);
         outputLabel = outputs.keySet().stream().findFirst().orElse(null);
         hslContentUrl = requestAccess(videoInfo, Map.of(outputLabel, outputs.get(outputLabel)));
@@ -66,8 +79,9 @@ public class NicoNicoSourceManager implements AudioSourceManager {
                 new AudioTrackInfo(videoInfo.get("data").get("response").get("video").get("title").safeText(),
                         videoInfo.get("data").get("response").get("owner").get("nickname").safeText(),
                         videoInfo.get("data").get("response").get("video").get("duration").asLong(0),
-                        videoId, false, getWatchUrl()),
-                this);
+                        getWatchUrl(), false, getWatchUrl()),
+                getHslContentUrl(), getSelectedOutput(),
+                getCookies(), getNicoSid(), getHeartbeatUrl());
     }
 
     @Override
@@ -76,18 +90,56 @@ public class NicoNicoSourceManager implements AudioSourceManager {
     }
 
     @Override
-    public void encodeTrack(AudioTrack track, DataOutput output) {
-        // nothing to encode
+    public void encodeTrack(AudioTrack track, DataOutput output) throws IOException {
+        NicoNicoAudioTrack nicoTrack = (NicoNicoAudioTrack) track;
+        output.writeUTF(nicoTrack.hlsContentUrl);
+        output.writeUTF(nicoTrack.cookies);
+        output.writeUTF(nicoTrack.nicoSid);
+        output.writeUTF(nicoTrack.heartBeatUrl);
+
+        // 手動で Map<String, List<String>> をシリアライズ
+        Map<String, List<String>> outputs = nicoTrack.selectedOutput;
+        output.writeInt(outputs.size());
+        for (Map.Entry<String, List<String>> entry : outputs.entrySet()) {
+            output.writeUTF(entry.getKey());
+            List<String> list = entry.getValue();
+            output.writeInt(list.size());
+            for (String item : list) {
+                output.writeUTF(item);
+            }
+        }
     }
 
     @Override
     public AudioTrack decodeTrack(AudioTrackInfo trackInfo, DataInput input) throws IOException {
-        return new NicoNicoAudioTrack(trackInfo, this);
+        String hlsContentUrl = input.readUTF();
+        String cookies = input.readUTF();
+        String nicoSid = input.readUTF();
+        String heartBeatUrl = input.readUTF();
+
+        // 手動で Map<String, List<String>> をデシリアライズ
+        int size = input.readInt();
+        Map<String, List<String>> outputs = new HashMap<>();
+        for (int i = 0; i < size; i++) {
+            String key = input.readUTF();
+            int listSize = input.readInt();
+            List<String> list = new ArrayList<>();
+            for (int j = 0; j < listSize; j++) {
+                list.add(input.readUTF());
+            }
+            outputs.put(key, list);
+        }
+
+        return new NicoNicoAudioTrack(trackInfo, hlsContentUrl, outputs, cookies, nicoSid, heartBeatUrl);
     }
 
     @Override
     public void shutdown() {
         // Nothing to shut down
+    }
+
+    public HttpInterfaceManager getHttpInterfaceManager() {
+        return httpInterfaceManager;
     }
 
     /**
@@ -216,8 +268,13 @@ public class NicoNicoSourceManager implements AudioSourceManager {
             try (var response = httpInterface.execute(request)) {
                 int status = response.getStatusLine().getStatusCode();
                 if (status == 201) {
-                    var cookies = response.getHeaders("Set-Cookie");
-                    for (var cookie : cookies) {
+                    var cookieHeader = response.getHeaders("Set-Cookie");
+                    for (var cookie : cookieHeader) {
+                        if (!cookies.isEmpty()) {
+                            cookies += "; ";
+                        }
+                        cookies += cookie.getValue().split(";", 2)[0];
+
                         if (cookie.getValue().startsWith("domand_bid=")) {
                             this.domandBid = cookie.getValue().split(";")[0].split("=")[1];
                         }
@@ -226,7 +283,8 @@ public class NicoNicoSourceManager implements AudioSourceManager {
                         }
                     }
 
-                    JsonBrowser json = JsonBrowser.parse(response.toString());
+                    String jsonString = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                    JsonBrowser json = JsonBrowser.parse(jsonString);
                     if (!json.get("data").isNull()) {
                         return json.get("data").get("contentUrl").text();
                     }
@@ -266,6 +324,10 @@ public class NicoNicoSourceManager implements AudioSourceManager {
         return this.outputLabel;
     }
 
+    public Map<String, List<String>> getSelectedOutput() {
+        return Map.of(getOutputLabel(), getOutputs().get(getOutputLabel()));
+    }
+
     public String getHslContentUrl() {
         return this.hslContentUrl;
     }
@@ -275,6 +337,17 @@ public class NicoNicoSourceManager implements AudioSourceManager {
     }
 
     public String getWatchUrl() {
-        return "https://nico.ms" + videoInfo.get("data").get("response").get("client").get("watchId").text();
+        return "https://nico.ms/" + videoInfo.get("data").get("response").get("client").get("watchId").text();
+    }
+
+    public String getHeartbeatUrl() {
+        String watchId = videoInfo.get("data").get("response").get("client").get("watchId").text();
+        String actionTrackId = videoInfo.get("data").get("response").get("client").get("watchTrackId").text();
+        return "https://nvapi.nicovideo.jp/v1/watch/" + watchId +
+                "/access-rights/hls?actionTrackId=" + actionTrackId + "&__retry=0";
+    }
+
+    public String getCookies() {
+        return this.cookies;
     }
 }
